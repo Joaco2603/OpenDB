@@ -1,5 +1,6 @@
 import { Node, Edge, MarkerType } from 'reactflow';
 import dagre from 'dagre';
+import { Parser } from '@dbml/core';
 
 const nodeWidth = 220;
 
@@ -7,114 +8,119 @@ interface Column {
   name: string;
   type: string;
   constraints: string;
+  note?: string;
 }
 
 interface Table {
   name: string;
+  note?: string;
+  indexes: string[];
   columns: Column[];
 }
+
+// Tipo de columna: @dbml/core lo entrega como objeto { type_name, args }.
+const typeName = (type: unknown): string => {
+  if (typeof type === 'string') return type;
+  if (type && typeof type === 'object' && 'type_name' in type) {
+    return String((type as { type_name: unknown }).type_name);
+  }
+  return '';
+};
+
+// Restricciones como texto (TableNode busca 'primary key' dentro).
+const constraintsOf = (field: {
+  pk?: boolean;
+  unique?: boolean;
+  not_null?: boolean;
+  increment?: boolean;
+}): string => {
+  const parts: string[] = [];
+  if (field.pk) parts.push('primary key');
+  if (field.unique) parts.push('unique');
+  if (field.not_null) parts.push('not null');
+  if (field.increment) parts.push('increment');
+  return parts.join(', ');
+};
 
 export const parseDbmlToFlow = (dbml: string) => {
   const nodes: Node[] = [];
   const edges: Edge[] = [];
   const tables: Table[] = [];
 
-  // Simple Regex Parser for Tables
-  // Matches: Table Name { body }
-  const tableRegex = /Table\s+(\w+)\s*\{([^}]+)\}/g;
-  let match;
-
-  // We need to reset lastIndex if we reuse regex, but here we create new one or use exec loop
-  // Note: exec loop updates lastIndex automatically
-  
-  // Clone dbml to avoid issues? No, string is immutable.
-  
-  while ((match = tableRegex.exec(dbml)) !== null) {
-    const tableName = match[1];
-    const body = match[2];
-    const columns = body.split('\n')
-      .map(line => line.trim())
-      .filter(line => line && !line.startsWith('//') && !line.startsWith('Note:')); // Basic filtering
-    
-    const parsedColumns = columns.map(col => {
-      // Simple split by space, but handle constraints like [pk]
-      // Example: id integer [primary key]
-      const parts = col.split(/\s+/);
-      if (parts.length < 2) return null; // Skip invalid lines
-
-      const name = parts[0];
-      const type = parts[1];
-      // Join the rest as constraints
-      const constraints = col.substring(col.indexOf('[') + 1, col.indexOf(']')) || '';
-      
-      return { name, type, constraints };
-    }).filter((col): col is Column => col !== null);
-
-    tables.push({ name: tableName, columns: parsedColumns });
+  // Un DBML a medio escribir no debe tumbar la app: sin diagrama hasta que compile.
+  let database;
+  try {
+    database = Parser.parse(dbml, 'dbml').export();
+  } catch (error) {
+    console.warn('DBML inválido:', error);
+    return { nodes: [] as Node[], edges: [] as Edge[] };
   }
 
-  // Create Nodes
-  tables.forEach((table) => {
-    nodes.push({
-      id: table.name,
-      type: 'tableNode', 
-      position: { x: 0, y: 0 },
-      data: { label: table.name, columns: table.columns },
+  database.schemas.forEach((schema) => {
+    schema.tables.forEach((table) => {
+      const columns: Column[] = table.fields.map((field) => ({
+        name: field.name,
+        type: typeName(field.type),
+        constraints: constraintsOf(field),
+        note: field.note || undefined,
+      }));
+      const indexes: string[] = (table.indexes ?? []).map((idx) => {
+        const cols = (idx.columns ?? []).map((c: { value: unknown }) => String(c.value)).join(', ');
+        return `(${cols})${idx.unique ? ' unique' : ''}`;
+      });
+      tables.push({ name: table.name, note: table.note || undefined, indexes, columns });
     });
   });
 
-  // Simple Regex Parser for Refs
-  // Ref: posts.user_id > users.id
-  // Ref: posts.user_id - users.id
-  // Ref: posts.user_id < users.id
-  const refRegex = /Ref:\s*(\w+)\.(\w+)\s*([<>]-?|[-])\s*(\w+)\.(\w+)/g;
-  while ((match = refRegex.exec(dbml)) !== null) {
-    const sourceTable = match[1];
-    const sourceCol = match[2];
-    const op = match[3];
-    const targetTable = match[4];
-    const targetCol = match[5];
-
-    // Determine direction
-    // > : source -> target
-    // < : target -> source
-    // - : source - target (undirected or bidirectional)
-    
-    let source = sourceTable;
-    let target = targetTable;
-    let sourceHandle = sourceCol;
-    let targetHandle = targetCol;
-    
-    if (op.includes('<')) {
-        source = targetTable;
-        target = sourceTable;
-        sourceHandle = targetCol;
-        targetHandle = sourceCol;
-    }
-
-    edges.push({
-      id: `e-${source}-${target}-${sourceHandle}-${targetHandle}`,
-      source: source,
-      target: target,
-      sourceHandle: sourceHandle,
-      targetHandle: targetHandle,
-      animated: true,
-      style: { stroke: '#b1b1b7' },
-      markerEnd: {
-        type: MarkerType.ArrowClosed,
-      },
+  tables.forEach((table) => {
+    nodes.push({
+      id: table.name,
+      type: 'tableNode',
+      position: { x: 0, y: 0 },
+      data: { label: table.name, note: table.note, indexes: table.indexes, columns: table.columns },
     });
-  }
+  });
 
-  // Auto Layout with Dagre
+  // Refs: inline (ref: > tabla.col) y de nivel superior (Ref: a.b > c.d).
+  // La flecha va del lado "muchos" (*) al lado "uno"; sin relación, del primero al segundo.
+  database.schemas.forEach((schema) => {
+    schema.refs.forEach((ref) => {
+      if (ref.endpoints.length < 2) return;
+      const [first, second] = ref.endpoints;
+      const source = first.relation === '1' && second.relation === '*' ? second : first;
+      const target = source === first ? second : first;
+      const sourceHandle = source.fieldNames[0];
+      const targetHandle = target.fieldNames[0];
+
+      edges.push({
+        id: `e-${source.tableName}-${target.tableName}-${sourceHandle}-${targetHandle}`,
+        source: source.tableName,
+        target: target.tableName,
+        sourceHandle,
+        targetHandle,
+        animated: true,
+        style: { stroke: '#b1b1b7' },
+        markerEnd: { type: MarkerType.ArrowClosed },
+      });
+    });
+  });
+
+  return { nodes: layoutTables(nodes, edges), edges };
+};
+
+// Altura estimada de una tabla: header + filas de columnas.
+const tableHeight = (columnCount: number) => 50 + columnCount * 30;
+
+export type LayoutDirection = 'auto' | 'down' | 'side';
+
+// Dagre con una dirección fija: 'down' = de arriba hacia abajo, 'side' = de izquierda a derecha.
+const runDagre = (nodes: Node[], edges: Edge[], rankdir: 'TB' | 'LR') => {
   const g = new dagre.graphlib.Graph();
-  g.setGraph({ rankdir: 'LR' });
+  g.setGraph({ rankdir });
   g.setDefaultEdgeLabel(() => ({}));
 
   nodes.forEach((node) => {
-    // Estimate height: Header (40) + Columns (28 * count) + Padding
-    const height = 50 + (node.data.columns.length * 30);
-    g.setNode(node.id, { width: nodeWidth, height: height });
+    g.setNode(node.id, { width: nodeWidth, height: tableHeight(node.data.columns.length) });
   });
 
   edges.forEach((edge) => {
@@ -122,17 +128,39 @@ export const parseDbmlToFlow = (dbml: string) => {
   });
 
   dagre.layout(g);
+  return g;
+};
 
-  const layoutedNodes = nodes.map((node) => {
-    const nodeWithPosition = g.node(node.id);
+// Auto layout con dagre. Solo posiciona nodos de tabla; el resto (notas) no se toca.
+// 'auto' prueba ambas direcciones y se queda con la que da una forma más cercana a una pantalla (16:10).
+export const layoutTables = (
+  nodes: Node[],
+  edges: Edge[],
+  direction: LayoutDirection = 'auto'
+): Node[] => {
+  const TARGET_RATIO = 16 / 10;
+  const down = runDagre(nodes, edges, 'TB');
+  const side = runDagre(nodes, edges, 'LR');
+
+  const ratioDistance = (g: dagre.graphlib.Graph) => {
+    const { width = 1, height = 1 } = g.graph();
+    const ratio = width / height;
+    return Math.abs(Math.log(ratio / TARGET_RATIO));
+  };
+
+  const g =
+    direction === 'down' ? down :
+    direction === 'side' ? side :
+    ratioDistance(down) <= ratioDistance(side) ? down : side;
+
+  return nodes.map((node) => {
+    const pos = g.node(node.id);
     return {
       ...node,
       position: {
-        x: nodeWithPosition.x - nodeWidth / 2,
-        y: nodeWithPosition.y - (50 + (node.data.columns.length * 30)) / 2,
+        x: pos.x - nodeWidth / 2,
+        y: pos.y - tableHeight(node.data.columns.length) / 2,
       },
     };
   });
-
-  return { nodes: layoutedNodes, edges };
 };
